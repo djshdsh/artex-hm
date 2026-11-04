@@ -1,0 +1,10 @@
+services:
+  artex:
+    restart: "no"
+    image: artex:local
+    shm_size: "2gb"
+    ulimits:
+      nofile: 65536
+    cap_add: [NET_RAW, NET_ADMIN]
+    environment:
+      TZ: Asia/Shanghai

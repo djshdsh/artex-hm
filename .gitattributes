@@ -1,0 +1,13 @@
+# 统一行尾：仓库内一律 LF（Windows 检出时 *.bat 保持 CRLF）
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.sh text eol=lf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.ico binary
+*.vhdx binary
+*.zip binary

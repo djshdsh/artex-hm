@@ -1,0 +1,93 @@
+# syntax=docker/dockerfile:1
+#
+# ARTEX 本地构建运行镜像（镜像内完成：前端静态导出 → Go 编译 → 运行环境）。
+# 上游 wpsec/ARTEX-local 的根 Dockerfile 只拷贝预编译二进制；本文件自包含，
+# 便于在 Windows/Docker Desktop 上直接构建，无需宿主安装 Go/Node/rsync。
+# 已接入国内镜像源以适配本机网络（Debian / npm / Go）。
+
+# ── ① 前端静态导出（Next.js）──────────────────────────────
+FROM node:22-bookworm-slim AS web
+WORKDIR /src/web
+COPY web/package.json web/package-lock.json ./
+RUN npm config set registry https://registry.npmmirror.com \
+    && npm ci --no-audit --no-fund
+COPY web/ ./
+ENV NEXT_EXPORT=1
+RUN npm run build:static
+
+# ── ② Go 编译：静态单二进制，内嵌前端 ─────────────────────
+FROM golang:1.26-bookworm AS build
+ARG TARGETARCH
+ARG ARTEX_VERSION=docker
+ENV GOPROXY=https://goproxy.cn,direct
+ENV GOSUMDB=sum.golang.google.cn
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+COPY --from=web /src/web/out ./server/webui/dist
+RUN CGO_ENABLED=0 GOOS=linux GOARCH="${TARGETARCH:-amd64}" \
+      go build -tags embedui -trimpath \
+      -ldflags "-s -w -X main.version=${ARTEX_VERSION}" \
+      -o /out/artex ./cmd/artex
+
+# ── ③ 攻防工具链（EXSALA 扩展）：Go 系二进制单独一层，走 goproxy 国内源 ──
+# 这些工具 Debian 仓库里没有，但 golang 镜像已在上面拉过、goproxy.cn 可达，
+# 因此直接在构建期编译进去，避免运行时再去联网下载。
+FROM golang:1.26-bookworm AS gotools
+ENV GOPROXY=https://goproxy.cn,direct \
+    GOSUMDB=off \
+    CGO_ENABLED=0 \
+    GOBIN=/out
+RUN go install github.com/ffuf/ffuf/v2@v2.1.0 \
+ && go install github.com/jpillora/chisel@v1.10.1 \
+ && go install github.com/projectdiscovery/dnsx/cmd/dnsx@v1.2.2 \
+ && ls -la /out
+
+# ── ④ 运行镜像 ────────────────────────────────────────────
+FROM python:3.12-slim-bookworm
+# Debian 换国内源（deb.debian.org 本机不可达）
+RUN set -eux; \
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
+      if [ -f "$f" ]; then sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' "$f"; fi; \
+    done
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates ripgrep curl wget vim git jq unzip rsync \
+      dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
+      sqlmap hydra gobuster masscan socat john hashcat dirb whatweb wfuzz \
+      python3-pip tcpdump openssh-client sshpass \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+# Python 侧攻防库（impacket 提供 smb/ldap/kerberos 客户端工具集）
+RUN pip install --no-cache-dir --break-system-packages -q \
+      -i https://pypi.tuna.tsinghua.edu.cn/simple \
+      impacket requests httpx websockets pyjwt
+# impacket 0.13 的入口脚本装成 secretsdump.py / GetNPUsers.py 这种形式；
+# skills 与旧文档里写的是 impacket-secretsdump，这里补一层别名，两种写法都能用。
+RUN for f in /usr/local/bin/*.py; do [ -f "$f" ] || continue; n=$(basename "$f" .py); ln -sf "$f" "/usr/local/bin/impacket-$n"; done \
+    && command -v impacket-secretsdump \
+    && command -v impacket-GetNPUsers
+COPY --from=gotools /out/ffuf /out/chisel /out/dnsx /usr/local/bin/
+# kx：剥离容器内坏代理的通用前缀（skills 里所有命令都依赖它，必须真的存在）
+RUN printf '%s\n' '#!/bin/sh' \
+      '# kx — 剥掉容器内 http(s)_proxy 等坏代理变量后执行命令' \
+      'exec env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY "$@"' \
+      > /usr/local/bin/kx \
+    && chmod +x /usr/local/bin/kx \
+    && kx curl --version | head -1
+# 预装 Playwright MCP 与 CLI + chromium（走 npmmirror）
+RUN npm config set registry https://registry.npmmirror.com \
+    && npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@latest \
+    && playwright-cli --help \
+    && playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=build /out/artex /app/artex
+COPY start.sh /app/start.sh
+RUN chmod +x /app/artex /app/start.sh
+COPY skills/ /app/skills/
+VOLUME ["/app/data"]
+EXPOSE 8787 8788
+ENTRYPOINT ["/app/start.sh"]
+CMD ["-addr", ":8787", "-proxy", ":8788"]

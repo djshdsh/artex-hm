@@ -1,0 +1,8 @@
+# EXSALA HERMES MOD · powered by Gienetic
+# 部署覆盖层示例：把 artex 服务切到本二开版构建出的镜像。
+# 用法：
+#   docker build -f Dockerfile.build -t artex:exsala .
+#   docker compose -p artex -f docker-compose.yml -f docker-compose.exsala.yml up -d
+services:
+  artex:
+    image: artex:exsala
